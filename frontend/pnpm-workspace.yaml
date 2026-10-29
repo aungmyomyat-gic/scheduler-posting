@@ -1,0 +1,5 @@
+# Local install policy only. This project does not include any sibling packages.
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

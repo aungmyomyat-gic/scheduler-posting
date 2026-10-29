@@ -1,0 +1,41 @@
+{
+  "user": {
+    "id": "d9428888-122b-4b7b-9300-987654321000",
+    "displayName": "Alex Morgan",
+    "email": "alex@example.com",
+    "createdAt": "2026-10-29T00:00:00.000Z",
+    "updatedAt": "2026-10-29T00:00:00.000Z"
+  },
+  "pagination": { "page": 1, "pageSize": 10, "total": 1, "totalPages": 1 },
+  "error": {
+    "success": false,
+    "message": "Please check the highlighted fields.",
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "fieldErrors": { "email": ["Enter a valid email address."] }
+    },
+    "meta": { "requestId": "example-request-id" }
+  },
+  "validCreate": [
+    { "displayName": "Alex Morgan", "email": "alex@example.com" },
+    { "displayName": " Jo ", "email": " JO@EXAMPLE.COM " }
+  ],
+  "invalidCreate": [
+    {},
+    { "displayName": "A", "email": "alex@example.com" },
+    { "displayName": "   ", "email": "alex@example.com" },
+    { "displayName": "Alex Morgan", "email": "invalid" },
+    { "displayName": "Alex Morgan", "email": "alex@example.com", "role": "admin" }
+  ],
+  "validUpdate": [{ "displayName": "Jamie Lee" }, { "email": "jamie@example.com" }],
+  "invalidUpdate": [{}, { "id": "d9428888-122b-4b7b-9300-987654321000" }, { "email": null }],
+  "validQuery": [{}, { "q": " Alex ", "page": "2", "pageSize": "5" }],
+  "invalidQuery": [
+    { "page": "0" },
+    { "page": "1.5" },
+    { "page": "100001" },
+    { "pageSize": "101" },
+    { "page": ["1", "2"] },
+    { "unknown": "value" }
+  ]
+}
