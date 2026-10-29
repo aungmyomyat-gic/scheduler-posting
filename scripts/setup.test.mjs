@@ -49,10 +49,10 @@ if (role === "backend") setInterval(() => {
 }, 50);
 `;
 
-async function listen(server) {
+async function listen(server, host = "127.0.0.1") {
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.listen(0, host, resolve);
   });
   return server.address().port;
 }
@@ -66,13 +66,23 @@ async function waitFor(check, failure, timeout = 15_000) {
   throw new Error(failure());
 }
 
-async function fixture(t, { existing = false, skipDb = false, failInstall = "" } = {}) {
+async function fixture(
+  t,
+  { existing = false, skipDb = false, failInstall = "", activeFrontend = false, ipv6 = false } = {},
+) {
   const root = await mkdtemp(path.join(tmpdir(), "foundation-launcher-"));
   const bin = path.join(root, "bin");
   for (const directory of [bin, path.join(root, "frontend"), path.join(root, "backend")]) {
     await mkdir(directory);
   }
   await copyFile(launcher, path.join(root, ".setup.sh"));
+  if (activeFrontend) {
+    await mkdir(path.join(root, "frontend/.next/dev"), { recursive: true });
+    await writeFile(
+      path.join(root, "frontend/.next/dev/lock"),
+      JSON.stringify({ pid: process.pid }),
+    );
+  }
   const backendEnv = `PORT=4000\nFRONTEND_ORIGIN=http://localhost:3000\nDATABASE_URL=${skipDb ? "postgresql://junior:example@db.example.com/prepared" : "postgresql://template:template@localhost:5432/team_template?schema=public"}\n# Existing custom comment stays intact.\n`;
   const frontendEnv = "NEXT_PUBLIC_API_BASE_URL=http://localhost:4000/api/v1\n";
   await writeFile(path.join(root, "backend/.env.example"), backendEnv);
@@ -90,7 +100,13 @@ async function fixture(t, { existing = false, skipDb = false, failInstall = "" }
   }
   await writeFile(path.join(bin, "mock-app.cjs"), appStub);
   const occupied = createServer();
-  const preferredWebPort = await listen(occupied);
+  let preferredWebPort;
+  try {
+    preferredWebPort = await listen(occupied, ipv6 ? "::1" : "127.0.0.1");
+  } catch (error) {
+    if (!ipv6 || !["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(error.code)) throw error;
+    preferredWebPort = await listen(occupied);
+  }
   const backendReservation = createServer();
   const preferredApiPort = await listen(backendReservation);
   await new Promise((resolve) => backendReservation.close(resolve));
@@ -200,8 +216,12 @@ test("first run bootstraps, skips occupied ports, and Ctrl+C stops both process 
 });
 
 test("existing environment files are unchanged and existing tables are not reseeded", async (t) => {
-  const run = await fixture(t, { existing: true });
+  const run = await fixture(t, { existing: true, ipv6: true });
   await run.ready();
+  const frontend = (await run.entries()).find(
+    (entry) => entry.kind === "app" && entry.role === "frontend",
+  );
+  assert.notEqual(frontend.port, run.preferredWebPort);
   assert.equal(await readFile(path.join(run.root, "backend/.env"), "utf8"), run.backendEnv);
   assert.equal(await readFile(path.join(run.root, "frontend/.env.local"), "utf8"), run.frontendEnv);
   assert.equal(
@@ -210,6 +230,14 @@ test("existing environment files are unchanged and existing tables are not resee
   );
   run.child.kill("SIGTERM");
   assert.equal((await run.closed()).code, 143);
+});
+
+test("an active frontend dev lock stops setup before files or services change", async (t) => {
+  const run = await fixture(t, { activeFrontend: true });
+  assert.equal((await run.closed()).code, 1);
+  assert.deepEqual(await run.entries(), []);
+  await assert.rejects(readFile(path.join(run.root, "backend/.env")), { code: "ENOENT" });
+  await assert.rejects(readFile(path.join(run.root, "frontend/.env.local")), { code: "ENOENT" });
 });
 
 test("prepared-database mode skips database setup and an app failure stops its peer", async (t) => {

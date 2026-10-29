@@ -27,6 +27,8 @@ The launcher preserves existing environment files, creates missing ones from the
 
 It chooses available frontend/backend ports, starting from the configured frontend origin and backend port. The printed URLs are used for the API client and CORS during that run; environment files are not rewritten. Press **Ctrl+C** to stop both apps. PostgreSQL keeps running and retains its data.
 
+If this checkout already has a running Next.js dev server, stop it with Ctrl+C in its terminal before using the launcher. The script checks the existing dev lock before installing or changing setup files.
+
 ```bash
 # Optional preferred ports; occupied ports are skipped.
 FRONTEND_PORT=3001 BACKEND_PORT=4001 ./.setup.sh

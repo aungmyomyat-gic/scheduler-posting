@@ -40,6 +40,26 @@ if [[ "$(node -p 'process.versions.node.split(".")[0]')" != 24 ]]; then
   printf 'Node.js 24 is required. Run nvm use from this folder.\n' >&2
   exit 1
 fi
+# A Next.js checkout has one dev lock, even when a different port is selected.
+node --input-type=module - <<'NODE'
+import { readFileSync } from "node:fs";
+try {
+  const lock = JSON.parse(readFileSync("frontend/.next/dev/lock", "utf8"));
+  if (Number.isSafeInteger(lock.pid) && lock.pid > 0) {
+    let alive = true;
+    try { process.kill(lock.pid, 0); } catch (error) { alive = error.code !== "ESRCH"; }
+    if (alive) {
+      console.error("A frontend dev server is already running for this checkout. Stop it with Ctrl+C before using .setup.sh.");
+      process.exitCode = 1;
+    }
+  }
+} catch (error) {
+  if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) {
+    console.error("Could not check the frontend dev lock. Check permissions for frontend/.next/dev.");
+    process.exitCode = 1;
+  }
+}
+NODE
 if [[ "$SKIP_DB" == false ]]; then
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     printf 'Docker Compose is required. Install Docker Desktop or use --skip-db.\n' >&2
@@ -73,6 +93,17 @@ try {
     }
   }
   const used = new Set();
+  async function availableOn(port, host) {
+    return new Promise((resolve, reject) => {
+      const server = createServer();
+      server.once("error", (error) => {
+        if (error.code === "EADDRINUSE") resolve(false);
+        else if (host === "::1" && ["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(error.code)) resolve(true);
+        else reject(error);
+      });
+      server.listen(port, host, () => server.close(() => resolve(true)));
+    });
+  }
   async function freePort(value) {
     const preferred = Number(value);
     if (!Number.isInteger(preferred) || preferred < 1024 || preferred > 65535) {
@@ -80,11 +111,7 @@ try {
     }
     for (let port = preferred; port <= Math.min(preferred + 100, 65535); port++) {
       if (used.has(port)) continue;
-      const available = await new Promise((resolve, reject) => {
-        const server = createServer();
-        server.once("error", (error) => error.code === "EADDRINUSE" ? resolve(false) : reject(error));
-        server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
-      });
+      const available = await availableOn(port, "127.0.0.1") && await availableOn(port, "::1");
       if (available) { used.add(port); return port; }
     }
     throw new Error("No free local port found. Choose another FRONTEND_PORT or BACKEND_PORT.");
@@ -118,71 +145,95 @@ fi
 
 WEB_ORIGIN="http://localhost:$FRONTEND_PORT"
 API_ORIGIN="http://localhost:$BACKEND_PORT"
-BACKEND_PID=""
-FRONTEND_PID=""
-
-cleanup() {
-  trap - EXIT INT TERM
-  printf '\nStopping frontend and backend…\n'
-  for pid in "$FRONTEND_PID" "$BACKEND_PID"; do
-    if [[ -n "$pid" ]]; then kill -TERM -- "-$pid" 2>/dev/null || true; fi
-  done
-  # Each app has its own process group, including pnpm, watchers, and child servers.
-  for ((attempt = 0; attempt < 50; attempt++)); do
-    if ! kill -0 -- "-${FRONTEND_PID:-0}" 2>/dev/null && ! kill -0 -- "-${BACKEND_PID:-0}" 2>/dev/null; then break; fi
-    sleep 0.1
-  done
-  for pid in "$FRONTEND_PID" "$BACKEND_PID"; do
-    if [[ -n "$pid" ]]; then
-      kill -KILL -- "-$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# Bash job control creates separate process groups on macOS, Linux, and WSL.
-set -m
-HOST=127.0.0.1 PORT="$BACKEND_PORT" FRONTEND_ORIGIN="$WEB_ORIGIN" \
-  pnpm --dir backend dev </dev/null &
-BACKEND_PID=$!
-NEXT_PUBLIC_API_BASE_URL="$API_ORIGIN/api/v1" \
-  pnpm --dir frontend dev --hostname 127.0.0.1 --port "$FRONTEND_PORT" </dev/null &
-FRONTEND_PID=$!
-set +m
-
 printf '\nStarting frontend: %s\nStarting API:      %s/api/v1\n' "$WEB_ORIGIN" "$API_ORIGIN"
-SETUP_WEB_PORT="$FRONTEND_PORT" SETUP_API_PORT="$BACKEND_PORT" node --input-type=module - <<'NODE'
+SETUP_WEB_PORT="$FRONTEND_PORT" SETUP_API_PORT="$BACKEND_PORT" exec node --input-type=module - <<'NODE'
+import { spawn } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
+
+const webPort = process.env.SETUP_WEB_PORT;
+const apiPort = process.env.SETUP_API_PORT;
+const webOrigin = `http://localhost:${webPort}`;
+const apiOrigin = `http://localhost:${apiPort}`;
+const apps = [];
+const abort = new AbortController();
+let stopping = false;
+
+function groupAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(-pid, 0); return true; }
+  catch (error) { return error.code !== "ESRCH"; }
+}
+function signalGroups(signal) {
+  for (const { child } of apps) {
+    if (!child.pid || !groupAlive(child.pid)) continue;
+    try { process.kill(-child.pid, signal); } catch (error) {
+      if (error.code !== "ESRCH") console.error("Could not signal an application process group.");
+    }
+  }
+}
+async function stop(code) {
+  if (stopping) return;
+  stopping = true;
+  abort.abort();
+  console.log("\nStopping frontend and backend…");
+  signalGroups("SIGTERM");
+  const deadline = Date.now() + 5000;
+  while (apps.some(({ child }) => groupAlive(child.pid)) && Date.now() < deadline) await delay(50);
+  signalGroups("SIGKILL");
+  await Promise.all(apps.map(({ closed }) => closed));
+  process.exit(code);
+}
+function launch(name, args, overrides) {
+  // A separate session gives each app a process group containing its watchers/servers.
+  const child = spawn("pnpm", args, {
+    detached: true,
+    stdio: ["ignore", "inherit", "inherit"],
+    env: { ...process.env, ...overrides },
+  });
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  apps.push({ child, closed });
+  child.once("error", () => {
+    console.error(`Could not start ${name}. Check the pnpm installation.`);
+    void stop(1);
+  });
+  child.once("exit", (code) => {
+    if (!stopping) {
+      console.error(`${name} stopped; stopping its peer.`);
+      void stop(code || 1);
+    }
+  });
+}
+process.once("SIGINT", () => void stop(130));
+process.once("SIGTERM", () => void stop(143));
+launch("Backend", ["--dir", "backend", "dev"], {
+  HOST: "127.0.0.1", PORT: apiPort, FRONTEND_ORIGIN: webOrigin,
+});
+launch("Frontend", ["--dir", "frontend", "dev", "--hostname", "127.0.0.1", "--port", webPort], {
+  NEXT_PUBLIC_API_BASE_URL: `${apiOrigin}/api/v1`,
+});
 const deadline = Date.now() + 60_000;
 const urls = [
-  `http://127.0.0.1:${process.env.SETUP_API_PORT}/api/v1/health`,
-  `http://127.0.0.1:${process.env.SETUP_WEB_PORT}`,
+  `http://127.0.0.1:${apiPort}/api/v1/health`,
+  `http://127.0.0.1:${webPort}`,
 ];
-while (Date.now() < deadline) {
-  const ready = await Promise.all(urls.map(async (url) => {
+let ready = false;
+while (!stopping && Date.now() < deadline) {
+  const results = await Promise.all(urls.map(async (url) => {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(1500) });
+      const response = await fetch(url, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(1500)]) });
       await response.body?.cancel();
       return response.ok;
     } catch { return false; }
   }));
-  if (ready.every(Boolean)) process.exit(0);
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  if (!stopping && results.every(Boolean)) { ready = true; break; }
+  await delay(500);
 }
-console.error("The apps did not become ready within 60 seconds. Check the startup logs above.");
-process.exitCode = 1;
+if (!stopping) {
+  if (ready) {
+    console.log(`\nBoth applications are ready. Open ${webOrigin}\nPress Ctrl+C to stop both apps. PostgreSQL stays running.`);
+  } else {
+    console.error("The apps did not become ready within 60 seconds. Check the startup logs above.");
+    await stop(1);
+  }
+}
 NODE
-
-printf '\nBoth applications are ready. Open %s\nPress Ctrl+C to stop both apps. PostgreSQL stays running.\n' "$WEB_ORIGIN"
-while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do sleep 1; done
-STATUS=0
-if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
-  wait "$BACKEND_PID" || STATUS=$?
-else
-  wait "$FRONTEND_PID" || STATUS=$?
-fi
-printf 'One application stopped; stopping its peer.\n' >&2
-if [[ "$STATUS" == 0 ]]; then STATUS=1; fi
-exit "$STATUS"
