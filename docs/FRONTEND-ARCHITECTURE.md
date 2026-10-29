@@ -41,6 +41,8 @@ app.ts -> users.routes -> users.controller -> users.service -> Prisma -> Postgre
 
 `app.ts` composes middleware and accepts a typed users service. Tests inject a service double; `server.ts` supplies the real Prisma service. There is no runtime mock switch. `server.ts` owns environment loading, listening and graceful shutdown.
 
+`features/health/` owns the health routes and controller, with its response schema in `contracts/health.ts`. `app.ts` mounts the feature at `/api/v1/health`. This liveness endpoint runs independently of the database, so it needs only a router and controller.
+
 Controllers parse untrusted inputs using `parseInput`, call the service, and respond with `sendSuccess`. Services map Prisma rows to public DTOs, converting Dates to ISO strings. Shared error middleware maps known database/application errors and catches async failures. Input validation errors become 422; output contract failures become 500.
 
 Prisma uses the PostgreSQL driver adapter. Generated code lives in ignored `backend/src/generated/prisma` and is compiled into the backend build. The schema, named migrations and repeatable seed remain in `backend/prisma`.

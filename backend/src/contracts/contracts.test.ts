@@ -3,6 +3,7 @@ import fixtures from "../../../docs/contract-fixtures.json" with { type: "json" 
 import schemas from "../../../docs/api-schemas.json" with { type: "json" };
 import { z } from "zod";
 import { errorResponseSchema } from "./api-response.js";
+import { healthResponseSchema } from "./health.js";
 import {
   createUserSchema,
   updateUserSchema,
@@ -10,7 +11,6 @@ import {
   userResponseSchema,
   userListResponseSchema,
   deleteUserResponseSchema,
-  healthResponseSchema,
 } from "./user.js";
 
 describe("approved transport fixtures", () => {

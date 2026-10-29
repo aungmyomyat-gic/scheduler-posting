@@ -5,11 +5,11 @@ import { createApp } from "./app.js";
 import { AppError } from "./lib/app-error.js";
 import { Prisma } from "./generated/prisma/client.js";
 import { errorResponseSchema } from "./contracts/api-response.js";
+import { healthResponseSchema } from "./contracts/health.js";
 import {
   userResponseSchema,
   userListResponseSchema,
   deleteUserResponseSchema,
-  healthResponseSchema,
 } from "./contracts/user.js";
 import type { UsersService } from "./features/users/users.service.js";
 

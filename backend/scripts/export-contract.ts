@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { z } from "zod";
 import { errorResponseSchema } from "../src/contracts/api-response.js";
+import { healthResponseSchema } from "../src/contracts/health.js";
 import {
   createUserSchema,
   updateUserSchema,
@@ -8,7 +9,6 @@ import {
   userResponseSchema,
   userListResponseSchema,
   deleteUserResponseSchema,
-  healthResponseSchema,
 } from "../src/contracts/user.js";
 
 const schemas = {

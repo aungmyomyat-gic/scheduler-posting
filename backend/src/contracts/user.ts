@@ -36,9 +36,6 @@ export const userListResponseSchema = successResponseSchema(z.array(userSchema))
   "List responses require pagination.",
 );
 export const deleteUserResponseSchema = successResponseSchema(z.strictObject({ id: z.uuid() }));
-export const healthResponseSchema = successResponseSchema(
-  z.strictObject({ status: z.literal("ok") }),
-);
 
 export type User = z.infer<typeof userSchema>;
 export type CreateUserInput = z.infer<typeof createUserSchema>;
