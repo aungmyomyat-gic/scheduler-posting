@@ -15,6 +15,7 @@ const { spawn } = require("node:child_process");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ tool: "pnpm", args }) + "\n");
 if (args[2] === "install" && process.env.MOCK_FAIL_INSTALL === args[1]) process.exit(2);
+if (args[2] === "db:deploy" && process.env.MOCK_FAIL_MIGRATE === "1") process.exit(3);
 if (args[2] === "dev") {
   fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ kind: "dev", pid: process.pid }) + "\n");
   const child = spawn(process.execPath, [path.join(__dirname, "mock-app.cjs"), args[1], ...args], { stdio: "inherit" });
@@ -26,7 +27,30 @@ const dockerStub = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ tool: "docker", args }) + "\n");
-if (args[1] === "exec") console.log(process.env.MOCK_TABLE_EXISTS === "1" ? "f" : "t");
+process.exit(99); // Any Docker dependency must fail these local PostgreSQL tests.
+`;
+const pgStub = String.raw`
+import fs from "node:fs";
+export default {
+  Client: class {
+    constructor(options) { this.options = options; }
+    async connect() {
+      const url = new URL(this.options.connectionString);
+      fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({
+        tool: "postgres", action: "connect", host: url.hostname, port: url.port,
+        database: url.pathname.slice(1),
+      }) + "\n");
+      if (process.env.MOCK_FAIL_DATABASE === "1") throw new Error(this.options.connectionString);
+    }
+    async query(sql) {
+      fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ tool: "postgres", action: "query", sql }) + "\n");
+      return { rows: [{ firstSetup: process.env.MOCK_TABLE_EXISTS !== "1" }] };
+    }
+    async end() {
+      fs.appendFileSync(process.env.MOCK_LOG, JSON.stringify({ tool: "postgres", action: "end" }) + "\n");
+    }
+  },
+};
 `;
 const appStub = String.raw`
 const fs = require("node:fs");
@@ -68,7 +92,17 @@ async function waitFor(check, failure, timeout = 15_000) {
 
 async function fixture(
   t,
-  { existing = false, skipDb = false, failInstall = "", activeFrontend = false, ipv6 = false } = {},
+  {
+    existing = false,
+    skipDb = false,
+    failInstall = "",
+    failDatabase = false,
+    failMigrate = false,
+    databaseUrl,
+    databaseOverride,
+    activeFrontend = false,
+    ipv6 = false,
+  } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "foundation-launcher-"));
   const bin = path.join(root, "bin");
@@ -83,7 +117,12 @@ async function fixture(
       JSON.stringify({ pid: process.pid }),
     );
   }
-  const backendEnv = `PORT=4000\nFRONTEND_ORIGIN=http://localhost:3000\nDATABASE_URL=${skipDb ? "postgresql://junior:example@db.example.com/prepared" : "postgresql://template:template@localhost:5432/team_template?schema=public"}\n# Existing custom comment stays intact.\n`;
+  const url =
+    databaseUrl ??
+    (skipDb
+      ? "postgresql://junior:example@db.example.com/prepared"
+      : "postgresql://template:template@localhost:5432/team_template?schema=public");
+  const backendEnv = `PORT=4000\nFRONTEND_ORIGIN=http://localhost:3000\nDATABASE_URL=${url}\n# Existing custom comment stays intact.\n`;
   const frontendEnv = "NEXT_PUBLIC_API_BASE_URL=http://localhost:4000/api/v1\n";
   await writeFile(path.join(root, "backend/.env.example"), backendEnv);
   await writeFile(path.join(root, "frontend/.env.example"), frontendEnv);
@@ -99,6 +138,13 @@ async function fixture(
     await chmod(path.join(bin, name), 0o755);
   }
   await writeFile(path.join(bin, "mock-app.cjs"), appStub);
+  const pgModule = path.join(root, "backend/node_modules/pg");
+  await mkdir(pgModule, { recursive: true });
+  await writeFile(
+    path.join(pgModule, "package.json"),
+    JSON.stringify({ type: "module", exports: "./index.js" }),
+  );
+  await writeFile(path.join(pgModule, "index.js"), pgStub);
   const occupied = createServer();
   let preferredWebPort;
   try {
@@ -114,13 +160,7 @@ async function fixture(
   const exitFile = path.join(root, "exit-backend");
   await writeFile(log, "");
   const env = { ...process.env };
-  for (const name of [
-    "DATABASE_URL",
-    "FRONTEND_ORIGIN",
-    "PORT",
-    "POSTGRES_PORT",
-    "SETUP_SKIP_DB",
-  ]) {
+  for (const name of ["DATABASE_URL", "FRONTEND_ORIGIN", "PORT", "SETUP_SKIP_DB"]) {
     delete env[name];
   }
   Object.assign(env, {
@@ -130,8 +170,11 @@ async function fixture(
     MOCK_LOG: log,
     MOCK_EXIT_FILE: exitFile,
     MOCK_FAIL_INSTALL: failInstall,
+    MOCK_FAIL_DATABASE: failDatabase ? "1" : "0",
+    MOCK_FAIL_MIGRATE: failMigrate ? "1" : "0",
     MOCK_TABLE_EXISTS: existing ? "1" : "0",
   });
+  if (databaseOverride !== undefined) env.DATABASE_URL = databaseOverride;
   const child = spawn("bash", [path.join(root, ".setup.sh"), ...(skipDb ? ["--skip-db"] : [])], {
     cwd: tmpdir(), // The launcher must resolve its own directory.
     env,
@@ -188,6 +231,7 @@ async function fixture(
     preferredWebPort,
     backendEnv,
     frontendEnv,
+    output: () => output,
     ready: () =>
       waitFor(
         () => output.includes("Both applications are ready."),
@@ -196,8 +240,10 @@ async function fixture(
   };
 }
 
-test("first run bootstraps, skips occupied ports, and Ctrl+C stops both process trees", async (t) => {
-  const run = await fixture(t);
+test("first run uses a custom local database, skips occupied ports, and Ctrl+C stops both process trees", async (t) => {
+  const run = await fixture(t, {
+    databaseUrl: "postgresql://junior:example@127.0.0.1:5544/scheduler_dev?schema=public",
+  });
   await run.ready();
   const entries = await run.entries();
   const app = (role) => entries.find((entry) => entry.kind === "app" && entry.role === role);
@@ -208,6 +254,24 @@ test("first run bootstraps, skips occupied ports, and Ctrl+C stops both process 
   assert.equal(await readFile(path.join(run.root, "frontend/.env.local"), "utf8"), run.frontendEnv);
   assert.equal(entries.filter((entry) => entry.args?.includes("db:deploy")).length, 1);
   assert.equal(entries.filter((entry) => entry.args?.includes("db:seed")).length, 1);
+  assert.deepEqual(
+    entries.find((entry) => entry.tool === "postgres" && entry.action === "connect"),
+    {
+      tool: "postgres",
+      action: "connect",
+      host: "127.0.0.1",
+      port: "5544",
+      database: "scheduler_dev",
+    },
+  );
+  assert.equal(
+    entries.some((entry) => entry.tool === "docker"),
+    false,
+  );
+  assert.ok(
+    entries.findIndex((entry) => entry.tool === "postgres" && entry.action === "query") <
+      entries.findIndex((entry) => entry.args?.includes("db:deploy")),
+  );
   run.child.kill("SIGINT");
   assert.equal((await run.closed()).code, 130);
   for (const entry of entries.filter((entry) => entry.kind === "app")) {
@@ -249,6 +313,10 @@ test("prepared-database mode skips database setup and an app failure stops its p
     false,
   );
   assert.equal(
+    entries.some((entry) => entry.tool === "postgres"),
+    false,
+  );
+  assert.equal(
     entries.some((entry) => entry.args?.includes("db:deploy")),
     false,
   );
@@ -272,6 +340,89 @@ test("an installation failure prevents database changes and app startup", async 
   );
   assert.equal(
     entries.some((entry) => entry.args?.includes("db:deploy")),
+    false,
+  );
+  assert.equal(
+    entries.some((entry) => entry.tool === "postgres"),
+    false,
+  );
+});
+
+test("a database connection failure stops before migrations and never prints credentials", async (t) => {
+  const run = await fixture(t, { failDatabase: true });
+  assert.equal((await run.closed()).code, 1);
+  const entries = await run.entries();
+  assert.equal(
+    entries.some((entry) => entry.tool === "postgres" && entry.action === "end"),
+    true,
+  );
+  assert.equal(
+    entries.some((entry) => entry.args?.includes("db:deploy")),
+    false,
+  );
+  assert.equal(
+    entries.some((entry) => entry.args?.includes("db:seed")),
+    false,
+  );
+  assert.equal(
+    entries.some((entry) => entry.kind === "app"),
+    false,
+  );
+  assert.match(run.output(), /Start the server, create the database and user/);
+  assert.doesNotMatch(run.output(), /postgresql:\/\/|template:template/);
+});
+
+test("an exported DATABASE_URL takes precedence without rewriting backend/.env", async (t) => {
+  const run = await fixture(t, {
+    existing: true,
+    databaseOverride: "postgres://junior:example@localhost:5545/override_db?schema=public",
+  });
+  await run.ready();
+  const connection = (await run.entries()).find(
+    (entry) => entry.tool === "postgres" && entry.action === "connect",
+  );
+  assert.equal(connection.port, "5545");
+  assert.equal(connection.database, "override_db");
+  assert.equal(await readFile(path.join(run.root, "backend/.env"), "utf8"), run.backendEnv);
+});
+
+for (const [name, databaseUrl] of [
+  ["remote database", "postgresql://junior:private-password@db.example.com/development"],
+  [
+    "remote host parameter",
+    "postgresql://junior:private-password@localhost/development?host=db.example.com",
+  ],
+  [
+    "duplicate remote host parameter",
+    "postgresql://junior:private-password@localhost/development?host=localhost&host=db.example.com",
+  ],
+  ["non-public schema", "postgresql://junior:private-password@localhost/development?schema=custom"],
+  ["missing database name", "postgresql://junior:private-password@localhost/"],
+  ["invalid database URL", "invalid-private-password"],
+]) {
+  test(`${name} prevents automatic setup without printing credentials`, async (t) => {
+    const run = await fixture(t, { databaseUrl });
+    assert.equal((await run.closed()).code, 1);
+    assert.deepEqual(await run.entries(), []);
+    assert.match(run.output(), /Check DATABASE_URL|Verify backend\/\.env/);
+    assert.doesNotMatch(run.output(), /private-password/);
+  });
+}
+
+test("a migration failure prevents seed and app startup", async (t) => {
+  const run = await fixture(t, { failMigrate: true });
+  assert.equal((await run.closed()).code, 3);
+  const entries = await run.entries();
+  assert.equal(
+    entries.some((entry) => entry.args?.includes("db:deploy")),
+    true,
+  );
+  assert.equal(
+    entries.some((entry) => entry.args?.includes("db:seed")),
+    false,
+  );
+  assert.equal(
+    entries.some((entry) => entry.kind === "app"),
     false,
   );
 });

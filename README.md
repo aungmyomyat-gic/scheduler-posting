@@ -15,7 +15,25 @@ Two independent projects in one parent folder. Each project has its own package 
 
 ## Start locally
 
-Requirements: **Node.js 24 LTS**, **pnpm 11.8.0**, and Docker Desktop running (or your own PostgreSQL instance). `.nvmrc` selects Node 24. The PostgreSQL credentials in the examples are fictional local development defaults.
+Requirements: **Node.js 24 LTS**, **pnpm 11.8.0**, and **PostgreSQL installed and running locally**. `.nvmrc` selects Node 24. Docker is not required. The PostgreSQL credentials in the examples are fictional local development defaults.
+
+Prepare your local database once before using the launcher:
+
+1. Start your local PostgreSQL server.
+2. Open `psql` or pgAdmin as your PostgreSQL administrator and create the example role and database (skip this if they already exist):
+
+   ```sql
+   CREATE ROLE template WITH LOGIN PASSWORD 'template';
+   CREATE DATABASE team_template OWNER template;
+   ```
+
+3. From the parent folder, create the backend environment file without overwriting an existing one:
+
+   ```bash
+   cp -n backend/.env.example backend/.env
+   ```
+
+   Set `DATABASE_URL` in `backend/.env` to your local database's user, password, host, port, and database name. The example matches the SQL above. Use a dedicated development database; the launcher applies migrations and may insert fictional sample users.
 
 Start everything with one command from the parent folder:
 
@@ -23,7 +41,7 @@ Start everything with one command from the parent folder:
 ./.setup.sh
 ```
 
-The launcher preserves existing environment files, creates missing ones from the examples, installs both projects with their lockfiles, generates Prisma, starts the local Compose database, and applies pending migrations. It seeds fictional users only when the User table did not exist before setup. Later runs preserve edits and deletions.
+The launcher preserves existing environment files, creates missing ones from the examples, installs both projects with their lockfiles, generates Prisma, checks your local database connection, and applies pending migrations. It seeds fictional users only when the User table did not exist before setup. Later runs preserve edits and deletions. It does not install or start PostgreSQL or create database roles/databases. Connection failures stop setup before migrations or app startup and print guidance without exposing credentials.
 
 It chooses available frontend/backend ports, starting from the configured frontend origin and backend port. The printed URLs are used for the API client and CORS during that run; environment files are not rewritten. Press **Ctrl+C** to stop both apps. PostgreSQL keeps running and retains its data.
 
@@ -33,18 +51,18 @@ If this checkout already has a running Next.js dev server, stop it with Ctrl+C i
 # Optional preferred ports; occupied ports are skipped.
 FRONTEND_PORT=3001 BACKEND_PORT=4001 ./.setup.sh
 
-# For an already migrated database: skip Docker, migrations, and seed.
+# For an already migrated database: skip its check, migrations, and seed.
 ./.setup.sh --skip-db
 ```
 
-Automatic database setup is limited to the local `team_template` Compose database. For your own prepared PostgreSQL database, set `backend/.env` and use `--skip-db`. Run `./.setup.sh --help` for the available options. The launcher supports macOS, Linux, and WSL and adds no shared package/workspace dependency.
+Automatic migrations and seeding require a local PostgreSQL database (`localhost`, `127.0.0.1`, or `::1`) using the `public` schema. Custom database names and ports come from `DATABASE_URL`; an exported `DATABASE_URL` takes precedence over `backend/.env`. For an already migrated remote database or a different schema, use `--skip-db`. Run `./.setup.sh --help` for the available options. The launcher supports macOS, Linux, and WSL and adds no shared package/workspace dependency.
 
 For manual setup, run from the parent folder:
 
 ```bash
 nvm use
 # Install pnpm 11.8.0 using your preferred Node package-manager setup if needed.
-docker compose up -d --wait
+# Start PostgreSQL and prepare the local database as described above.
 
 cp -n backend/.env.example backend/.env
 pnpm --dir backend install --frozen-lockfile
@@ -70,11 +88,11 @@ pnpm --dir frontend dev
 
 Open **http://localhost:3000**. The API runs at **http://localhost:4000/api/v1**. Change URLs in the respective environment files when needed; `FRONTEND_ORIGIN` must match the browser origin exactly. Restart the applications after changing environment values. For a production frontend build, public environment values are embedded at build time.
 
-If port 5432 is occupied, run `POSTGRES_PORT=5433 docker compose up -d --wait` and update the port in `backend/.env` before migrating. Keep the same `POSTGRES_PORT` for later Compose operations.
+If your local PostgreSQL server uses a port other than 5432, set that port in `DATABASE_URL` in `backend/.env` before migrating.
 
 If frontend port 3000 is occupied, start with `pnpm --dir frontend dev --port 3001` and set `FRONTEND_ORIGIN=http://localhost:3001` in the backend environment. Restart Express after this change.
 
-The seed inserts six fictional users with `example.com` emails. It can be run again without deleting existing rows or overwriting edits. Data lives in a Docker named volume; `docker compose stop` stops PostgreSQL and preserves data.
+The seed inserts six fictional users with `example.com` emails. It can be run again without deleting existing rows or overwriting edits. Data lives in your local PostgreSQL database and is preserved when the applications stop. Manage the PostgreSQL server with your operating system's service tools.
 
 Each project's `pnpm-workspace.yaml` contains **local dependency build approvals only** (Prisma/native tooling). It has no sibling package globs and does not join the frontend and backend into a workspace. Keep these narrow install policies when adding dependencies.
 
@@ -107,7 +125,6 @@ backend/                   # Independent Express project
   prisma/                  # Schema, named migrations, repeatable seed
   scripts/export-contract.ts
 docs/                      # API agreement and junior workflow
-compose.yaml               # Local PostgreSQL, separate from app dependencies
 ```
 
 Backend and frontend do not import each other's code. Their tests compare Zod schemas against the reviewed `docs/api-schemas.json` and validate common fixtures. Keep `docs/` beside both applications when running contract tests; either application can build and run independently.
@@ -138,10 +155,10 @@ pnpm --dir frontend format:check
 
 Backend `pnpm test` uses a typed service double and a real HTTP server on an ephemeral local port. It does not need PostgreSQL. Frontend tests cover the API client, contract agreement, and component behavior. Generated Prisma code is ignored by Git and regenerated by backend checks/builds.
 
-For the database integration test, create a separate database in the local container once:
+For the database integration test, create a separate local database once as your PostgreSQL administrator (shown as `postgres`; adjust users and connection URLs for your installation):
 
 ```bash
-docker compose exec -T postgres createdb -U template team_template_test
+createdb -h localhost -p 5432 -U postgres -W -O template team_template_test
 DATABASE_URL=postgresql://template:template@localhost:5432/team_template_test pnpm --dir backend db:deploy
 TEST_DATABASE_URL=postgresql://template:template@localhost:5432/team_template_test pnpm --dir backend test:integration
 ```

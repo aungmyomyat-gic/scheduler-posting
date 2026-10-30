@@ -14,12 +14,12 @@ Usage: ./.setup.sh [--skip-db]
 
 Install dependencies, prepare the local PostgreSQL database, and start both apps.
 Existing environment files and database records are preserved. Ctrl+C stops both
-apps and leaves PostgreSQL running. Requires Node.js 24, pnpm, and running Docker.
+apps and leaves PostgreSQL running. Requires Node.js 24, pnpm, and local PostgreSQL.
 
-  --skip-db  Use an already prepared database; skip Docker, migrations, and seed.
+  --skip-db  Use an already prepared database; skip its check, migrations, and seed.
 
 FRONTEND_PORT and BACKEND_PORT set preferred ports; occupied ports are skipped.
-POSTGRES_PORT must match DATABASE_URL when using the local Compose database.
+Start local PostgreSQL and create the database in backend/.env before running.
 HELP
     exit 0
     ;;
@@ -60,17 +60,6 @@ try {
   }
 }
 NODE
-if [[ "$SKIP_DB" == false ]]; then
-  if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
-    printf 'Docker Compose is required. Install Docker Desktop or use --skip-db.\n' >&2
-    exit 1
-  fi
-  if ! docker info >/dev/null 2>&1; then
-    printf 'Docker is stopped. Start Docker Desktop and run this script again.\n' >&2
-    exit 1
-  fi
-fi
-
 if [[ ! -e backend/.env ]]; then cp -n backend/.env.example backend/.env; fi
 if [[ ! -e frontend/.env.local ]]; then cp -n frontend/.env.example frontend/.env.local; fi
 
@@ -84,12 +73,13 @@ try {
   const backend = { ...parseEnv(readFileSync("backend/.env", "utf8")), ...process.env };
   const database = new URL(backend.DATABASE_URL);
   if (process.env.SETUP_SKIP_DB !== "true") {
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(database.hostname);
+    const localHosts = ["localhost", "127.0.0.1", "[::1]", "::1"];
+    const local = localHosts.includes(database.hostname) &&
+      database.searchParams.getAll("host").every((host) => localHosts.includes(host));
     if (!local || !["postgres:", "postgresql:"].includes(database.protocol) ||
-        (database.port || "5432") !== (process.env.POSTGRES_PORT || "5432") ||
-        database.pathname !== "/team_template" ||
+        !database.pathname || database.pathname === "/" ||
         (database.searchParams.get("schema") || "public") !== "public") {
-      throw new Error("Automatic database setup supports the local Compose database only. Use --skip-db for an already prepared database, or check DATABASE_URL and POSTGRES_PORT.");
+      throw new Error("Automatic database setup requires a local PostgreSQL database using the public schema. Check DATABASE_URL in backend/.env, or use --skip-db for an already prepared database.");
     }
   }
   const used = new Set();
@@ -136,8 +126,31 @@ pnpm --dir backend db:generate
 
 if [[ "$SKIP_DB" == false ]]; then
   printf '\nPreparing local PostgreSQL…\n'
-  docker compose up -d --wait postgres
-  FIRST_DATABASE_SETUP="$(docker compose exec -T postgres psql -U template -d team_template -tAc "SELECT to_regclass('public.\"User\"') IS NULL;")"
+  FIRST_DATABASE_SETUP="$(
+    cd backend
+    node --input-type=module - <<'NODE'
+import { readFileSync } from "node:fs";
+import { parseEnv } from "node:util";
+import pg from "pg";
+
+const env = { ...parseEnv(readFileSync(".env", "utf8")), ...process.env };
+const client = new pg.Client({
+  connectionString: env.DATABASE_URL,
+  connectionTimeoutMillis: 5000,
+  query_timeout: 5000,
+});
+try {
+  await client.connect();
+  const result = await client.query(`SELECT to_regclass('public."User"') IS NULL AS "firstSetup"`);
+  console.log(result.rows[0].firstSetup ? "t" : "f");
+} catch {
+  console.error("Could not check local PostgreSQL. Start the server, create the database and user, and verify DATABASE_URL in backend/.env. See README.md for setup steps.");
+  process.exitCode = 1;
+} finally {
+  await client.end();
+}
+NODE
+  )"
   pnpm --dir backend db:deploy
   # Seed only a new database. Deleted sample records stay deleted on later runs.
   if [[ "$FIRST_DATABASE_SETUP" == t ]]; then pnpm --dir backend db:seed; fi
